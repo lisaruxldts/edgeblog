@@ -3,8 +3,7 @@ import { getSiteByHost } from "../db/queries";
 import { ensureSchema } from "../db/schema";
 import { hostTag, mediaTag, siteTag } from "../db/site";
 import type { RedirectRow, Site } from "../db/types";
-import { isSeoBot } from "../lib/bots";
-import { flag } from "../lib/util";
+import { redirectKey } from "../lib/util";
 import { renderFeed, renderRobots, renderSitemap } from "./feeds";
 import * as data from "./data";
 import {
@@ -33,6 +32,14 @@ function html(body: string, status: number, site: Site, cacheSeconds: number): R
 	return new Response(body, { status, headers });
 }
 
+// 带 cache-tag：改了重定向或域名后，按站点/主机清缓存能清掉旧的跳转
+function redirect(location: string, status: number, tags: string[]): Response {
+	return new Response(null, {
+		status,
+		headers: { location, "cache-control": "public, max-age=3600", "cache-tag": tags.join(",") },
+	});
+}
+
 function text(body: string, contentType: string, site: Site, cacheSeconds: number): Response {
 	return new Response(body, {
 		headers: {
@@ -53,11 +60,14 @@ export class SiteRenderer extends WorkerEntrypoint<Env> {
 			return new Response("Site not found", { status: 404, headers: { "cache-control": "public, max-age=60" } });
 		}
 
-		if (flag(this.env.BLOCK_SEO_BOTS) && isSeoBot(request.headers.get("user-agent"))) {
-			return new Response("Forbidden", { status: 403, headers: { "cache-control": "public, max-age=3600" } });
+		// 只认主域名：www/裸域等别名一律 301 过去，否则同一个站在搜索引擎眼里是两份。
+		// 查询串不进缓存键，所以也不带过去，免得一个人的参数被缓存后跳给所有人
+		if (host !== site.primary_domain) {
+			return redirect(`https://${site.primary_domain}${url.pathname}`, 301, [siteTag(site.id), hostTag(host)]);
 		}
 
-		const origin = `${url.protocol}//${url.host}`;
+		// canonical、og:url、站点地图、RSS 里的绝对地址固定用 https 主域名：缓存键不含协议，不能取自请求
+		const origin = `https://${site.primary_domain}`;
 		const route = resolveRoute(site, url.pathname);
 
 		// 这些路由不渲染主题，跳过侧栏数据查询
@@ -74,7 +84,15 @@ export class SiteRenderer extends WorkerEntrypoint<Env> {
 				return this.serveMedia(site, route.path);
 		}
 
-		const input: RenderInput = { site, origin, common: await data.loadCommon(this.env.DB, site) };
+		// 重定向优先于内容（首页除外），分类、标签、分页路径也查；和侧栏数据并行查，不多占一轮往返。
+		// 键用 redirectKey 规范化，和后台存库的写法一致，/a、/a/、/a.html 都能命中
+		const [common, rule] = await Promise.all([
+			data.loadCommon(this.env.DB, site),
+			route.kind === "home" && route.page === 1 ? null : this.findRedirect(site.id, redirectKey(url.pathname)),
+		]);
+		if (rule) return redirect(rule.to_url, rule.status_code, [siteTag(site.id)]);
+
+		const input: RenderInput = { site, origin, common };
 		const perPage = site.settings.posts_per_page;
 
 		switch (route.kind) {
@@ -101,13 +119,6 @@ export class SiteRenderer extends WorkerEntrypoint<Env> {
 				return html(body, 200, site, 300);
 			}
 			case "entry": {
-				const redirect = await this.findRedirect(site.id, route.path);
-				if (redirect) {
-					return new Response(null, {
-						status: redirect.status_code,
-						headers: { location: redirect.to_url, "cache-control": "public, max-age=3600" },
-					});
-				}
 				const post = await data.getEntryByPath(this.env.DB, site, route.path);
 				if (!post) return this.notFound(input, site);
 				if (post.type === "page") return html(renderPage(input, post), 200, site, 600);

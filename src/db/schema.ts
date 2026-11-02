@@ -87,6 +87,11 @@ const MIGRATIONS: string[][] = [
 			created_at INTEGER NOT NULL
 		)`,
 	],
+	// v2：重定向来源统一去掉尾斜杠，与 redirectKey 一致；规范化后撞键的旧行以已存在的无斜杠版本为准
+	[
+		`UPDATE OR IGNORE redirects SET from_path = rtrim(from_path, '/') WHERE from_path <> '/' AND from_path LIKE '%/'`,
+		`DELETE FROM redirects WHERE from_path <> '/' AND from_path LIKE '%/'`,
+	],
 ];
 
 let schemaReady = false;

@@ -101,6 +101,12 @@ export function normalizePath(input: string): string {
 	return p.replace(/\/{2,}/g, "/");
 }
 
+// 重定向来源的统一键：在 normalizePath 基础上去掉尾斜杠（根路径除外）。后台存库和前台查找都必须用它
+export function redirectKey(input: string): string {
+	const p = normalizePath(input);
+	return p === "/" ? p : p.replace(/\/+$/, "");
+}
+
 export function parseTimestamp(v: unknown): number | null {
 	if (v === null || v === undefined || v === "") return null;
 	if (typeof v === "number") return Number.isFinite(v) ? Math.floor(v > 1e12 ? v / 1000 : v) : null;
