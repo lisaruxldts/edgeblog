@@ -10,7 +10,10 @@ export const VIEW_COLS = `${SUMMARY_COLS}, p.type, p.content_html, p.meta_title,
 
 export const VISIBLE = `p.status = 'published' AND p.published_at <= ?2`;
 
-export async function getSiteByHost(db: D1Database, host: string): Promise<Site | null> {
+// 前台读路径拿到的可能是 D1Database，也可能是读副本会话 D1DatabaseSession，两者都只用到 prepare/batch
+export type Reader = Pick<D1Database, "prepare" | "batch">;
+
+export async function getSiteByHost(db: Reader, host: string): Promise<Site | null> {
 	const row = await db
 		.prepare(`SELECT s.* FROM domains d JOIN sites s ON s.id = d.site_id WHERE d.hostname = ?`)
 		.bind(host)
@@ -34,7 +37,7 @@ export interface Common {
 	recent: PostSummary[];
 }
 
-export function commonStatements(db: D1Database, siteId: number, ts: number): D1PreparedStatement[] {
+export function commonStatements(db: Reader, siteId: number, ts: number): D1PreparedStatement[] {
 	return [
 		db
 			.prepare(
