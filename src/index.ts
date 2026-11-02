@@ -28,6 +28,12 @@ export default {
 			}
 		}
 
+		// 只有 GET/HEAD 能走缓存。扫描器对 /xmlrpc.php、/wp-login.php 之类的 POST 每次都会穿透到渲染入口查库，
+		// 而所有站共用一个 D1 库（单线程），在这里直接拒掉
+		if (request.method !== "GET" && request.method !== "HEAD") {
+			return new Response("Method Not Allowed", { status: 405, headers: { allow: "GET, HEAD", "cache-control": "no-store" } });
+		}
+
 		// 拦 SEO 爬虫只能放在这个不缓存的入口：SiteRenderer 命中缓存时代码不运行，
 		// 且缓存键不含 User-Agent——在那里返回的 403 会被存下来，发给 Googlebot 和所有访客
 		if (flag(env.BLOCK_SEO_BOTS) && isSeoBot(request.headers.get("user-agent"))) {
