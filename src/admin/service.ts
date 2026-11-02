@@ -10,6 +10,7 @@ import {
 	now,
 	parseList,
 	parseTimestamp,
+	redirectKey,
 	slugify,
 } from "../lib/util";
 import { ensureSlug, metaDescription, prepareContent } from "./content";
@@ -17,7 +18,7 @@ import { buildPostPath } from "../site/resolve";
 
 export interface Ctx {
 	db: D1Database;
-	// 以 SiteRenderer 身份清缓存：env.SITE_RENDERER.purge(...)
+	// 以 SiteRenderer 身份按 tag 清缓存；被限流时自动入队，由定时任务重试（见 site/purge.ts）
 	purge(options: CachePurgeOptions): Promise<CachePurgeResult>;
 }
 
@@ -94,27 +95,30 @@ export async function createSite(ctx: Ctx, input: SiteInput): Promise<Site> {
 	const domains = await collectDomains(primary, input.domains);
 
 	try {
-		const row = await ctx.db
-			.prepare(
-				`INSERT INTO sites (name, tagline, primary_domain, language, timezone, theme, theme_options, settings, status, created_at, updated_at)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING *`,
-			)
-			.bind(
-				name,
-				(input.tagline ?? "").trim(),
-				primary,
-				language,
-				timezone,
-				theme,
-				JSON.stringify(themeOptions),
-				JSON.stringify(settings),
-				input.status === "paused" ? "paused" : "active",
-				ts,
-				ts,
-			)
-			.first<SiteRow>();
+		// 建站和绑域名放进同一个 batch（D1 batch 是事务）：任一域名已被占用就整体回滚，不会留下没有域名的空站
+		const [inserted] = await ctx.db.batch<SiteRow>([
+			ctx.db
+				.prepare(
+					`INSERT INTO sites (name, tagline, primary_domain, language, timezone, theme, theme_options, settings, status, created_at, updated_at)
+					VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING *`,
+				)
+				.bind(
+					name,
+					(input.tagline ?? "").trim(),
+					primary,
+					language,
+					timezone,
+					theme,
+					JSON.stringify(themeOptions),
+					JSON.stringify(settings),
+					input.status === "paused" ? "paused" : "active",
+					ts,
+					ts,
+				),
+			...bindDomainStatements(ctx.db, primary, domains),
+		]);
+		const row = inserted.results[0];
 		if (!row) throw new HttpError(500, "failed to create site");
-		await bindDomains(ctx.db, row.id, domains);
 		await ctx.purge({ tags: domains.map(hostTag) });
 		return (await getSiteById(ctx.db, row.id)) as Site;
 	} catch (err) {
@@ -137,10 +141,11 @@ export async function updateSite(ctx: Ctx, siteId: number, input: SiteInput): Pr
 	const status = input.status === "active" || input.status === "paused" ? input.status : site.status;
 
 	const oldDomains = await getSiteDomains(ctx.db, siteId);
-	const domains = input.domains !== undefined || input.primary_domain ? await collectDomains(primary, input.domains ?? oldDomains) : oldDomains;
+	const rebind = input.domains !== undefined || !!input.primary_domain;
+	const domains = rebind ? await collectDomains(primary, input.domains ?? oldDomains) : oldDomains;
 
-	try {
-		await ctx.db
+	const statements = [
+		ctx.db
 			.prepare(
 				`UPDATE sites SET name=?, tagline=?, primary_domain=?, language=?, timezone=?, theme=?, theme_options=?, settings=?, status=?, updated_at=? WHERE id=?`,
 			)
@@ -156,9 +161,14 @@ export async function updateSite(ctx: Ctx, siteId: number, input: SiteInput): Pr
 				status,
 				now(),
 				siteId,
-			)
-			.run();
-		if (input.domains !== undefined || input.primary_domain) await replaceDomains(ctx.db, siteId, domains);
+			),
+	];
+	// 先删后插必须和站点更新在同一个 batch 里：分开执行时插入失败，删除已提交，站点一个域名都不剩、整站 404
+	if (rebind) {
+		statements.push(ctx.db.prepare(`DELETE FROM domains WHERE site_id = ?`).bind(siteId), ...bindDomainStatements(ctx.db, primary, domains));
+	}
+	try {
+		await ctx.db.batch(statements);
 	} catch (err) {
 		throw mapConstraint(err, "domain already bound to another site");
 	}
@@ -174,14 +184,11 @@ export async function deleteSite(ctx: Ctx, siteId: number): Promise<void> {
 	await ctx.purge({ tags: [siteTag(siteId), ...domains.map(hostTag)] });
 }
 
-async function bindDomains(db: D1Database, siteId: number, domains: string[]): Promise<void> {
-	if (domains.length === 0) return;
-	await db.batch(domains.map((host) => db.prepare(`INSERT INTO domains (hostname, site_id) VALUES (?, ?)`).bind(host, siteId)));
-}
-
-async function replaceDomains(db: D1Database, siteId: number, domains: string[]): Promise<void> {
-	await db.prepare(`DELETE FROM domains WHERE site_id = ?`).bind(siteId).run();
-	await bindDomains(db, siteId, domains);
+// 按主域名找站点 id 来绑定：建站时还拿不到 id，也能和 INSERT/UPDATE sites 放进同一个 batch
+function bindDomainStatements(db: D1Database, primary: string, domains: string[]): D1PreparedStatement[] {
+	return domains.map((host) =>
+		db.prepare(`INSERT INTO domains (hostname, site_id) SELECT ?, id FROM sites WHERE primary_domain = ?`).bind(host, primary),
+	);
 }
 
 export interface PostInput {
@@ -220,10 +227,33 @@ export async function upsertTerm(db: D1Database, siteId: number, taxonomy: "cate
 	return row as Term;
 }
 
+// 标签整批处理：一个 batch 补建缺的标签，再一次查回 id，标签再多也只占 2 次查询。
+// 逐个 upsert 时，批量发 100 篇、每篇 10 个标签就是上千次单独查询，会撞上 D1 单次调用的查询数上限（batch 只算一次）
 async function resolveTags(db: D1Database, siteId: number, tags: unknown): Promise<number[]> {
-	const names = parseList(tags).slice(0, 15);
+	const terms = parseList(tags)
+		.slice(0, 15)
+		.map((name) => ({ name, slug: slugify(name) || `t-${now()}` }));
+	if (terms.length === 0) return [];
+	await db.batch(
+		terms.map((t) =>
+			db
+				.prepare(
+					`INSERT OR IGNORE INTO terms (site_id, taxonomy, name, slug, description)
+					SELECT ?1, 'tag', ?2, ?3, '' WHERE NOT EXISTS (SELECT 1 FROM terms WHERE site_id = ?1 AND taxonomy = 'tag' AND name = ?2)`,
+				)
+				.bind(siteId, t.name, t.slug),
+		),
+	);
+	const marks = terms.map(() => "?").join(",");
+	const { results } = await db
+		.prepare(`SELECT id, name, slug FROM terms WHERE site_id = ? AND taxonomy = 'tag' AND (slug IN (${marks}) OR name IN (${marks}))`)
+		.bind(siteId, ...terms.map((t) => t.slug), ...terms.map((t) => t.name))
+		.all<{ id: number; name: string; slug: string }>();
 	const ids: number[] = [];
-	for (const name of names) ids.push((await upsertTerm(db, siteId, "tag", name)).id);
+	for (const t of terms) {
+		const row = results.find((r) => r.slug === t.slug) ?? results.find((r) => r.name === t.name);
+		if (row) ids.push(row.id);
+	}
 	return ids;
 }
 
@@ -231,8 +261,9 @@ function contentFormat(v: unknown): ContentFormat {
 	return v === "html" ? "html" : "markdown";
 }
 
-export async function createPost(ctx: Ctx, siteId: number, input: PostInput): Promise<{ id: number; path: string }> {
-	const site = await getSiteById(ctx.db, siteId);
+// preloaded：批量发文时站点只查一次
+export async function createPost(ctx: Ctx, siteId: number, input: PostInput, preloaded?: Site): Promise<{ id: number; path: string }> {
+	const site = preloaded ?? (await getSiteById(ctx.db, siteId));
 	if (!site) throw new HttpError(404, "site not found");
 
 	const title = (input.title ?? "").trim();
@@ -244,10 +275,9 @@ export async function createPost(ctx: Ctx, siteId: number, input: PostInput): Pr
 	const ts = now();
 	const publishedAt = status === "published" ? parseTimestamp(input.published_at) ?? ts : parseTimestamp(input.published_at);
 
-	const categoryId = input.category?.trim() ? (await upsertTerm(ctx.db, siteId, "category", input.category)).id : null;
-	const categorySlug = categoryId
-		? (await ctx.db.prepare(`SELECT slug FROM terms WHERE id = ?`).bind(categoryId).first<{ slug: string }>())?.slug ?? null
-		: null;
+	const category = input.category?.trim() ? await upsertTerm(ctx.db, siteId, "category", input.category) : null;
+	const categoryId = category?.id ?? null;
+	const categorySlug = category?.slug ?? null;
 
 	const slug = ensureSlug(input.slug ?? "", title, 0);
 	const path = resolvePath(site, type, slug, categorySlug, publishedAt ?? ts, input.path);
@@ -394,20 +424,26 @@ function resolvePath(
 }
 
 export async function setRedirect(ctx: Ctx, siteId: number, from: string, to: string, status: number): Promise<void> {
-	const fromPath = normalizePath(from);
+	// 缓存键不含查询串（见 index.ts），/?p=123 这类请求到不了查重定向这一步；直接拒绝，而不是像以前那样静默存成 /
+	if (from.includes("?")) throw new HttpError(400, "redirects from URLs with a query string are not supported");
+	const fromPath = redirectKey(from);
+	if (fromPath === "/") throw new HttpError(400, "cannot redirect the home page");
+	const target = to.trim();
+	if (!target) throw new HttpError(400, "to is required");
+	if (target.startsWith("/") && redirectKey(target) === fromPath) throw new HttpError(400, "redirect would point to itself");
 	const code = status === 302 || status === 307 || status === 308 ? status : 301;
 	await ctx.db
 		.prepare(
 			`INSERT INTO redirects (site_id, from_path, to_url, status_code) VALUES (?,?,?,?)
 			ON CONFLICT(site_id, from_path) DO UPDATE SET to_url = excluded.to_url, status_code = excluded.status_code`,
 		)
-		.bind(siteId, fromPath, to.trim(), code)
+		.bind(siteId, fromPath, target, code)
 		.run();
 	await ctx.purge({ tags: [siteTag(siteId)] });
 }
 
 export async function deleteRedirect(ctx: Ctx, siteId: number, from: string): Promise<void> {
-	await ctx.db.prepare(`DELETE FROM redirects WHERE site_id = ? AND from_path = ?`).bind(siteId, normalizePath(from)).run();
+	await ctx.db.prepare(`DELETE FROM redirects WHERE site_id = ? AND from_path = ?`).bind(siteId, redirectKey(from)).run();
 	await ctx.purge({ tags: [siteTag(siteId)] });
 }
 

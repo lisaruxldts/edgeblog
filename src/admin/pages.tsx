@@ -2,6 +2,7 @@
 import type { FC } from "hono/jsx";
 import type { MediaRow, PostRow, Site } from "../db/types";
 import { THEMES } from "../themes";
+import { editableSummary } from "./content";
 import { Checkbox, Field, Layout, Select, StatusTag, TextArea } from "./ui";
 import type { Flash } from "./ui";
 
@@ -440,7 +441,7 @@ export const PostForm: FC<{
 								<Field label="Slug" name="slug" value={post?.slug} hint="blank = from title" />
 							</div>
 							<TextArea label="Content" name="content" value={post?.content} rows={20} mono hint="Markdown or raw HTML" />
-							<TextArea label="Excerpt" name="excerpt" value={post?.excerpt} hint="blank = auto from content" rows={2} />
+							<TextArea label="Excerpt" name="excerpt" value={post && editableSummary(post)} hint="blank = auto from content" rows={2} />
 						</div>
 						<div class="card">
 							<h2>SEO</h2>
@@ -563,7 +564,10 @@ export const RedirectsPage: FC<{
 			<a href="/admin/sites">Sites</a> / <a href={`/admin/sites/${site.id}`}>{site.name}</a> / Redirects
 		</div>
 		<h1>Redirects</h1>
-		<p class="sub">301/302 redirects matched before content lookup.</p>
+		<p class="sub">
+			301/302 redirects, checked before content on every path except the home page. Trailing slashes don't matter; query
+			strings (/?p=123) are not supported.
+		</p>
 		<div class="card">
 			<form method="post" action={`/admin/sites/${site.id}/redirects`}>
 				<div class="row" style="align-items:flex-end">

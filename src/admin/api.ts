@@ -6,6 +6,7 @@ import { HttpError } from "../lib/util";
 import { type Env, requireBearer } from "./auth";
 import { deleteMedia, listMedia, uploadMedia } from "./media";
 import {
+	type Ctx,
 	type PostInput,
 	type SiteInput,
 	createPost,
@@ -121,19 +122,33 @@ api.post("/sites/:id/posts/bulk", async (c) => {
 	const items = Array.isArray(body) ? body : Array.isArray((body as { posts?: unknown })?.posts) ? (body as { posts: unknown[] }).posts : null;
 	if (!items) throw new HttpError(400, "expected an array of posts or { posts: [...] }");
 	if (items.length > 100) throw new HttpError(400, "max 100 posts per request");
+	const site = await getSiteById(c.env.DB, id);
+	if (!site) throw new HttpError(404, "site not found");
+
+	// 逐篇只记下要清的 tag，最后合并成一次 purge：purge 每账号限流 5 次/分钟，且单个请求最多调用 32 次 ctx.exports，
+	// 逐篇清的话从第 30 篇左右起会抛异常——文章已经入库，接口却报这一篇失败
+	const tags = new Set<string>();
+	const deferred: Ctx = {
+		db: c.var.ctx.db,
+		purge: async (options) => {
+			for (const tag of options.tags ?? []) tags.add(tag);
+			return { success: true, errors: [] };
+		},
+	};
 
 	const results: { ok: boolean; id?: number; path?: string; error?: string }[] = [];
 	let created = 0;
 	for (const item of items) {
 		try {
 			if (!item || typeof item !== "object") throw new HttpError(400, "invalid post item");
-			const res = await createPost(c.var.ctx, id, item as PostInput);
+			const res = await createPost(deferred, id, item as PostInput, site);
 			results.push({ ok: true, ...res });
 			created++;
 		} catch (err) {
 			results.push({ ok: false, error: err instanceof Error ? err.message : String(err) });
 		}
 	}
+	if (tags.size > 0) await c.var.ctx.purge({ tags: [...tags] });
 	return c.json({ created, failed: items.length - created, results }, created > 0 ? 201 : 400);
 });
 

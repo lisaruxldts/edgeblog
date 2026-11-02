@@ -1,7 +1,9 @@
 import admin from "./admin/app";
 import { ensureSchema } from "./db/schema";
 import { siteTag } from "./db/site";
-import { parseList } from "./lib/util";
+import { isSeoBot } from "./lib/bots";
+import { flag, parseList } from "./lib/util";
+import { flushPurgeQueue, queuePurge } from "./site/purge";
 
 export { SiteRenderer } from "./site/renderer";
 
@@ -26,6 +28,12 @@ export default {
 			}
 		}
 
+		// 拦 SEO 爬虫只能放在这个不缓存的入口：SiteRenderer 命中缓存时代码不运行，
+		// 且缓存键不含 User-Agent——在那里返回的 403 会被存下来，发给 Googlebot 和所有访客
+		if (flag(env.BLOCK_SEO_BOTS) && isSeoBot(request.headers.get("user-agent"))) {
+			return new Response("Forbidden", { status: 403, headers: { "cache-control": "no-store" } });
+		}
+
 		// 租户站点：走 SiteRenderer 入口（已开缓存）。自定义缓存键按「主机名+路径」隔离多站点，
 		// 并丢弃查询串，天然合并掉 utm 等追踪参数。
 		return ctx.exports.SiteRenderer.fetch(request, {
@@ -33,7 +41,7 @@ export default {
 		});
 	},
 
-	// 定时任务：让“定时发布”的文章到点可见——给刚过发布时间的站点清缓存
+	// 定时任务：让“定时发布”的文章到点可见——给刚过发布时间的站点清缓存，并重试之前被限流的清缓存
 	async scheduled(_controller, env, ctx): Promise<void> {
 		await ensureSchema(env.DB);
 		const nowTs = Math.floor(Date.now() / 1000);
@@ -44,10 +52,8 @@ export default {
 		)
 			.bind(windowStart, nowTs)
 			.all<{ site_id: number }>();
-		if (rows.results.length === 0) return;
-		const renderer = ctx.exports.SiteRenderer;
-		for (const { site_id } of rows.results) {
-			await renderer.purge({ tags: [siteTag(site_id)] });
-		}
+		// 不再逐站调用 purge（每账号 5 次/分钟、单请求最多 32 次调用）：先入队，再按 100 个 tag 一批冲刷
+		await queuePurge(env.DB, rows.results.map(({ site_id }) => siteTag(site_id)));
+		await flushPurgeQueue(env.DB, ctx.exports.SiteRenderer);
 	},
 } satisfies ExportedHandler<Env>;
