@@ -236,7 +236,13 @@ export const classic: Theme = {
 					</header>
 					{post.cover_image && (
 						<figure class="entry-cover">
-							<img src={post.cover_image} alt={post.title} />
+							<img
+								src={post.cover_image}
+								alt={post.title}
+								width={post.cover_width ?? undefined}
+								height={post.cover_height ?? undefined}
+								fetchpriority="high"
+							/>
 						</figure>
 					)}
 					<Html class="entry-content" html={post.content_html} />

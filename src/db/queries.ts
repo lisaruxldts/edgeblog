@@ -6,7 +6,9 @@ export const SUMMARY_COLS = `p.id, p.title, p.path, p.summary AS excerpt, p.cove
 	p.published_at, p.updated_at, t.name AS category_name, t.slug AS category_slug`;
 
 export const VIEW_COLS = `${SUMMARY_COLS}, p.type, p.content_html, p.meta_title, p.meta_description,
-	p.canonical_url, p.noindex, p.category_id`;
+	p.canonical_url, p.noindex, p.category_id,
+	(SELECT m.width FROM media m WHERE m.site_id = p.site_id AND m.path = p.cover_image) AS cover_width,
+	(SELECT m.height FROM media m WHERE m.site_id = p.site_id AND m.path = p.cover_image) AS cover_height`;
 
 export const VISIBLE = `p.status = 'published' AND p.published_at <= ?2`;
 

@@ -3,7 +3,8 @@ import { getSiteByHost } from "../db/queries";
 import { ensureSchema } from "../db/schema";
 import { hostTag, mediaTag, siteTag } from "../db/site";
 import type { RedirectRow, Site } from "../db/types";
-import { redirectKey } from "../lib/util";
+import { encodePath, redirectKey } from "../lib/util";
+import { renderFavicon } from "./favicon";
 import { renderFeed, renderRobots, renderSitemap } from "./feeds";
 import * as data from "./data";
 import {
@@ -38,6 +39,13 @@ function redirect(location: string, status: number, tags: string[]): Response {
 		status,
 		headers: { location, "cache-control": "public, max-age=3600", "cache-tag": tags.join(",") },
 	});
+}
+
+// 同一内容只留一个地址：少尾斜杠、多余斜杠、/category/x/page/1/ 这类变体一律 301 到规范地址（和 canonical 一致）。
+// 比较的是请求里编码后的原始路径，跳转目标再请求一次必然相等，不会循环；目标只取决于路径，可以和页面一样缓存
+function canonicalRedirect(url: URL, origin: string, path: string, site: Site): Response | null {
+	const target = encodePath(path);
+	return url.pathname === target ? null : redirect(origin + target, 301, [siteTag(site.id)]);
 }
 
 function text(body: string, contentType: string, site: Site, cacheSeconds: number): Response {
@@ -94,6 +102,10 @@ export class SiteRenderer extends WorkerEntrypoint<Env> {
 			}
 			case "sitemap":
 				return text(renderSitemap(origin, await data.sitemapEntries(db, site)), "application/xml; charset=utf-8", site, 1800);
+			case "favicon":
+				// 页面里声明的是 /favicon.svg；/favicon.ico 只有不读 <link rel="icon"> 的客户端会来要
+				if (route.legacy) return redirect(`${origin}/favicon.svg`, 301, [siteTag(site.id)]);
+				return text(renderFavicon(site), "image/svg+xml", site, 86400);
 			case "media":
 				return this.serveMedia(site, route.path);
 		}
@@ -110,6 +122,8 @@ export class SiteRenderer extends WorkerEntrypoint<Env> {
 				const input: RenderInput = { site, origin, common: page.common };
 				const pages = data.totalPages(page.total, perPage);
 				if (route.page > pages && route.page > 1) return this.notFound(input, site);
+				const moved = canonicalRedirect(url, origin, route.page > 1 ? `/page/${route.page}/` : "/", site);
+				if (moved) return moved;
 				return html(renderHome(input, listData(page.posts, route.page, pages, "/")), 200, site, 300);
 			}
 			case "category":
@@ -119,9 +133,11 @@ export class SiteRenderer extends WorkerEntrypoint<Env> {
 				if (page.redirect) return this.follow(site, page.redirect);
 				const input: RenderInput = { site, origin, common: page.common };
 				if (!page.term) return this.notFound(input, site);
-				const base = `/${taxonomy === "category" ? site.settings.category_base : site.settings.tag_base}/${route.slug}/`;
+				const base = `/${taxonomy === "category" ? site.settings.category_base : site.settings.tag_base}/${page.term.slug}/`;
 				const pages = data.totalPages(page.total, perPage);
 				if (route.page > pages && route.page > 1) return this.notFound(input, site);
+				const moved = canonicalRedirect(url, origin, route.page > 1 ? `${base}page/${route.page}/` : base, site);
+				if (moved) return moved;
 				return html(renderArchive(input, archiveData(taxonomy, page.term, page.posts, route.page, pages, base)), 200, site, 300);
 			}
 			case "entry": {
@@ -129,6 +145,8 @@ export class SiteRenderer extends WorkerEntrypoint<Env> {
 				if (page.redirect) return this.follow(site, page.redirect);
 				const input: RenderInput = { site, origin, common: page.common };
 				if (!page.post) return this.notFound(input, site);
+				const moved = canonicalRedirect(url, origin, page.post.path, site);
+				if (moved) return moved;
 				if (page.post.type === "page") return html(renderPage(input, page.post), 200, site, 600);
 				return html(renderPost(input, { post: page.post, tags: page.tags, related: page.related }), 200, site, 600);
 			}

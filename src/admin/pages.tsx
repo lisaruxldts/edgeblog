@@ -566,7 +566,8 @@ export const RedirectsPage: FC<{
 		<h1>Redirects</h1>
 		<p class="sub">
 			301/302 redirects, checked before content on every path except the home page. Trailing slashes don't matter; query
-			strings (/?p=123) are not supported.
+			strings (/?p=123) are not supported. Changing the URL of a published post adds a 301 here automatically, and
+			publishing a post at a path removes any redirect from that path.
 		</p>
 		<div class="card">
 			<form method="post" action={`/admin/sites/${site.id}/redirects`}>

@@ -60,8 +60,9 @@ export function renderRobots(site: Site, origin: string): string {
 	if (site.settings.robots_txt.trim()) {
 		return site.settings.robots_txt.includes("Sitemap:") ? site.settings.robots_txt : `${site.settings.robots_txt}\nSitemap: ${origin}/sitemap.xml\n`;
 	}
+	// 标签页不在这里屏蔽：它们自带 noindex（noindex_tags），被 robots.txt 挡住的页面 Google 读不到 noindex，
+	// 反而会以「已编入索引，但被 robots.txt 屏蔽」的形式出现，文章指向标签页的链接也成了死胡同
 	const disallow = [`/admin`, `/api/`];
-	if (site.settings.noindex_tags) disallow.push(`/${site.settings.tag_base}/`);
 	return `User-agent: *
 ${disallow.map((d) => `Disallow: ${d}`).join("\n")}
 
