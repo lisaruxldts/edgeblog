@@ -107,6 +107,20 @@ export function redirectKey(input: string): string {
 	return p === "/" ? p : p.replace(/\/+$/, "");
 }
 
+// 文章/页面的存库路径一律带尾斜杠：前台按 /段/段/ 查库，不带的永远查不到，也是 canonical 和 301 的目标形式
+export function entryPath(input: string): string {
+	const p = normalizePath(input);
+	return p.endsWith("/") ? p : `${p}/`;
+}
+
+// 文章最终的 canonical：后台填了 Canonical URL（转载、跨站发布）就用它，只认 http(s) 绝对地址或站内路径；否则是文章自己的地址
+export function canonicalFor(origin: string, path: string, custom: string | null | undefined): string {
+	const v = custom?.trim();
+	if (v && /^https?:\/\//i.test(v)) return v;
+	if (v?.startsWith("/")) return origin + encodePath(v);
+	return origin + encodePath(path);
+}
+
 export function parseTimestamp(v: unknown): number | null {
 	if (v === null || v === undefined || v === "") return null;
 	if (typeof v === "number") return Number.isFinite(v) ? Math.floor(v > 1e12 ? v / 1000 : v) : null;

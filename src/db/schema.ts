@@ -92,6 +92,8 @@ const MIGRATIONS: string[][] = [
 		`UPDATE OR IGNORE redirects SET from_path = rtrim(from_path, '/') WHERE from_path <> '/' AND from_path LIKE '%/'`,
 		`DELETE FROM redirects WHERE from_path <> '/' AND from_path LIKE '%/'`,
 	],
+	// v3：media 记录像素宽高（上传时从文件头读出），渲染时给 <img> 补 width/height
+	[`ALTER TABLE media ADD COLUMN width INTEGER`, `ALTER TABLE media ADD COLUMN height INTEGER`],
 ];
 
 let schemaReady = false;

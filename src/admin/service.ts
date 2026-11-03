@@ -4,16 +4,17 @@ import type { ContentFormat, PostStatus, PostType, Site, SiteRow, Term } from ".
 import { getTheme, randomTheme } from "../themes";
 import {
 	HttpError,
+	encodePath,
+	entryPath,
 	isValidTimezone,
 	normalizeHost,
-	normalizePath,
 	now,
 	parseList,
 	parseTimestamp,
 	redirectKey,
 	slugify,
 } from "../lib/util";
-import { ensureSlug, metaDescription, prepareContent } from "./content";
+import { ensureSlug, metaDescription, prepareContent, uploadedImages, withImageSizes } from "./content";
 import { buildPostPath } from "../site/resolve";
 
 export interface Ctx {
@@ -272,6 +273,7 @@ export async function createPost(ctx: Ctx, siteId: number, input: PostInput, pre
 	const status: PostStatus = input.status === "draft" ? "draft" : "published";
 	const format = contentFormat(input.content_format);
 	const prepared = prepareContent(input.content ?? "", format, input.excerpt ?? "");
+	prepared.content_html = await sizeImages(ctx.db, siteId, prepared.content_html);
 	const ts = now();
 	const publishedAt = status === "published" ? parseTimestamp(input.published_at) ?? ts : parseTimestamp(input.published_at);
 
@@ -283,7 +285,7 @@ export async function createPost(ctx: Ctx, siteId: number, input: PostInput, pre
 	const path = resolvePath(site, type, slug, categorySlug, publishedAt ?? ts, input.path);
 
 	try {
-		const row = await ctx.db
+		const insert = ctx.db
 			.prepare(
 				`INSERT INTO posts (site_id, type, status, title, slug, path, path_custom, excerpt, summary, content, content_format, content_html,
 				cover_image, category_id, author_name, meta_title, meta_description, canonical_url, noindex, published_at, created_at, updated_at)
@@ -311,8 +313,9 @@ export async function createPost(ctx: Ctx, siteId: number, input: PostInput, pre
 				input.noindex ? 1 : 0,
 				publishedAt,
 				ts,
-			)
-			.first<{ id: number }>();
+			);
+		const [inserted] = await ctx.db.batch<{ id: number }>([insert, ...redirectStatements(ctx.db, siteId, path, status === "published", null)]);
+		const row = inserted.results[0];
 		if (!row) throw new HttpError(500, "failed to create post");
 		const tagIds = await resolveTags(ctx.db, siteId, input.tags);
 		await attachTags(ctx.db, row.id, tagIds);
@@ -338,6 +341,7 @@ export async function updatePost(ctx: Ctx, siteId: number, postId: number, input
 	const format = input.content_format ? contentFormat(input.content_format) : (existing.content_format as ContentFormat);
 	const rawContent = input.content !== undefined ? input.content : existing.content;
 	const prepared = prepareContent(rawContent, format, input.excerpt ?? (input.content !== undefined ? "" : existing.summary));
+	prepared.content_html = await sizeImages(ctx.db, siteId, prepared.content_html);
 
 	let categoryId = existing.category_id;
 	let categorySlug: string | null = null;
@@ -352,13 +356,17 @@ export async function updatePost(ctx: Ctx, siteId: number, postId: number, input
 
 	// path 固定或用户显式指定时不变；否则按当前 permalink 规则重算
 	let path = existing.path;
-	if (input.path) path = normalizePath(input.path);
+	if (input.path) path = entryPath(input.path);
 	else if (!existing.path_custom && (input.slug !== undefined || input.category !== undefined || input.published_at !== undefined)) {
 		path = resolvePath(site, type, slug, categorySlug, publishedAt ?? existing.created_at, undefined);
 	}
 
+	// 已经公开过的文章换了地址，旧地址要 301 过来；草稿、还没到点的定时文章没被收录过，不用留跳转
+	const wasPublic = existing.status === "published" && existing.published_at !== null && existing.published_at <= now();
+	const movedFrom = wasPublic && path !== existing.path ? existing.path : null;
+
 	try {
-		await ctx.db
+		const update = ctx.db
 			.prepare(
 				`UPDATE posts SET type=?, status=?, title=?, slug=?, path=?, path_custom=?, excerpt=?, summary=?, content=?, content_format=?,
 				content_html=?, cover_image=?, category_id=?, author_name=?, meta_title=?, meta_description=?, canonical_url=?, noindex=?, published_at=?, updated_at=?
@@ -386,8 +394,8 @@ export async function updatePost(ctx: Ctx, siteId: number, postId: number, input
 				publishedAt,
 				now(),
 				postId,
-			)
-			.run();
+			);
+		await ctx.db.batch([update, ...redirectStatements(ctx.db, siteId, path, status === "published", movedFrom)]);
 		if (input.tags !== undefined) {
 			await ctx.db.prepare(`DELETE FROM post_tags WHERE post_id = ?`).bind(postId).run();
 			await attachTags(ctx.db, postId, await resolveTags(ctx.db, siteId, input.tags));
@@ -418,9 +426,51 @@ function resolvePath(
 	publishedAt: number,
 	custom: string | undefined,
 ): string {
-	if (custom) return normalizePath(custom);
+	if (custom) return entryPath(custom);
 	if (type === "page") return `/${slug}/`;
 	return buildPostPath({ permalink: site.settings.permalink, slug, categorySlug, publishedAt, timezone: site.timezone });
+}
+
+// 文章地址相关的跳转维护，和文章写入放在同一个 batch 里（一起成功或一起回滚）：
+// - 公开过的文章改了地址（movedFrom）：旧地址 301 到新地址；原先指向旧地址的跳转改成直达新地址，不形成跳转链。
+// - 文章发布在某个地址上：删掉这个地址上挂着的跳转。前台重定向优先于内容，不删的话文章会被它盖住——
+//   改回原来的 slug、或新文章用了以前被重定向走的地址时都会遇到；上一步改写出的自指跳转也在这里删掉
+function redirectStatements(db: D1Database, siteId: number, path: string, published: boolean, movedFrom: string | null): D1PreparedStatement[] {
+	const to = encodePath(path);
+	const key = redirectKey(path);
+	// 只差尾斜杠（旧版存下的不带斜杠的自定义路径）不算换地址，否则会生成指向自己的跳转
+	const old = movedFrom && redirectKey(movedFrom) !== "/" && redirectKey(movedFrom) !== key ? movedFrom : null;
+	const out: D1PreparedStatement[] = [];
+	if (old) {
+		out.push(
+			db
+				.prepare(`UPDATE redirects SET to_url = ? WHERE site_id = ? AND to_url IN (?, ?, ?)`)
+				.bind(to, siteId, old, encodePath(old), redirectKey(old)),
+		);
+	}
+	if (published || old) out.push(db.prepare(`DELETE FROM redirects WHERE site_id = ? AND from_path = ?`).bind(siteId, key));
+	if (old) {
+		out.push(
+			db
+				.prepare(
+					`INSERT INTO redirects (site_id, from_path, to_url, status_code) VALUES (?, ?, ?, 301)
+					ON CONFLICT(site_id, from_path) DO UPDATE SET to_url = excluded.to_url, status_code = excluded.status_code`,
+				)
+				.bind(siteId, redirectKey(old), to),
+		);
+	}
+	return out;
+}
+
+// 正文引用的本站上传图片补上 width/height（尺寸在上传时读出存进 media 表），浏览器据此预留位置，加载时版面不跳
+async function sizeImages(db: D1Database, siteId: number, html: string): Promise<string> {
+	const paths = uploadedImages(html).slice(0, 90); // D1 单条语句最多 100 个绑定参数
+	if (paths.length === 0) return html;
+	const { results } = await db
+		.prepare(`SELECT path, width, height FROM media WHERE site_id = ? AND width IS NOT NULL AND path IN (${paths.map(() => "?").join(",")})`)
+		.bind(siteId, ...paths)
+		.all<{ path: string; width: number; height: number }>();
+	return withImageSizes(html, new Map(results.map((r) => [r.path, { width: r.width, height: r.height }])));
 }
 
 export async function setRedirect(ctx: Ctx, siteId: number, from: string, to: string, status: number): Promise<void> {

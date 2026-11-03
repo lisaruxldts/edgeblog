@@ -9,6 +9,7 @@ export type Route =
 	| { kind: "feed" }
 	| { kind: "sitemap" }
 	| { kind: "robots" }
+	| { kind: "favicon"; legacy: boolean }
 	| { kind: "media"; path: string }
 	| { kind: "not-found" };
 
@@ -27,6 +28,7 @@ export function resolveRoute(site: Site, pathname: string): Route {
 	if (clean === "/feed" || clean === "/feed.xml" || clean === "/rss" || clean === "/rss.xml") return { kind: "feed" };
 	if (clean === "/sitemap.xml" || clean === "/sitemap") return { kind: "sitemap" };
 	if (clean === "/robots.txt") return { kind: "robots" };
+	if (clean === "/favicon.svg" || clean === "/favicon.ico") return { kind: "favicon", legacy: clean === "/favicon.ico" };
 
 	const segments = clean.split("/").filter(Boolean);
 	if (segments[0] === "uploads") return { kind: "media", path: `/${segments.join("/")}` };

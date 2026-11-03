@@ -24,6 +24,29 @@ export function editableSummary(post: { summary: string; excerpt: string }): str
 	return post.summary === post.excerpt || post.summary === truncate(post.excerpt, SUMMARY_MAX) ? "" : post.summary;
 }
 
+const IMG_TAG = /<img\b[^>]*>/gi;
+const UPLOAD_SRC = /\ssrc\s*=\s*(["'])(\/uploads\/[^"'?#]+)\1/i;
+const HAS_SIZE = /\s(?:width|height)\s*=/i;
+
+// 正文里引用本站上传图片（/uploads/...）且还没写宽高的 <img>
+export function uploadedImages(html: string): string[] {
+	const paths = new Set<string>();
+	for (const tag of html.match(IMG_TAG) ?? []) {
+		const src = tag.match(UPLOAD_SRC)?.[2];
+		if (src && !HAS_SIZE.test(tag)) paths.add(src);
+	}
+	return [...paths];
+}
+
+export function withImageSizes(html: string, sizes: Map<string, { width: number; height: number }>): string {
+	if (sizes.size === 0) return html;
+	return html.replace(IMG_TAG, (tag) => {
+		const src = tag.match(UPLOAD_SRC)?.[2];
+		const size = src && !HAS_SIZE.test(tag) ? sizes.get(src) : undefined;
+		return size ? tag.replace(/^<img\b/i, `<img width="${size.width}" height="${size.height}"`) : tag;
+	});
+}
+
 export function metaDescription(explicit: string, summary: string): string {
 	return truncate((explicit.trim() || summary).replace(/\s+/g, " "), 160);
 }

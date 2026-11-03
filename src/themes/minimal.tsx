@@ -148,7 +148,16 @@ export const minimal: Theme = {
 						</>
 					)}
 				</p>
-				{post.cover_image && <img class="cover" src={post.cover_image} alt={post.title} />}
+				{post.cover_image && (
+					<img
+						class="cover"
+						src={post.cover_image}
+						alt={post.title}
+						width={post.cover_width ?? undefined}
+						height={post.cover_height ?? undefined}
+						fetchpriority="high"
+					/>
+				)}
 				<Html class="body" html={post.content_html} />
 				{tags.length > 0 && (
 					<p class="tags">

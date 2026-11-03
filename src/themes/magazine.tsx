@@ -247,7 +247,16 @@ export const magazine: Theme = {
 							<Time ts={post.published_at} label={ctx.date(post.published_at)} />
 						</div>
 					</header>
-					{post.cover_image && <img class="mg-hero-img" src={post.cover_image} alt={post.title} />}
+					{post.cover_image && (
+						<img
+							class="mg-hero-img"
+							src={post.cover_image}
+							alt={post.title}
+							width={post.cover_width ?? undefined}
+							height={post.cover_height ?? undefined}
+							fetchpriority="high"
+						/>
+					)}
 					<Html class="mg-body" html={post.content_html} />
 					{tags.length > 0 && (
 						<div class="mg-tags">

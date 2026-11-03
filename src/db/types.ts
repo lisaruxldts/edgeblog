@@ -92,6 +92,9 @@ export interface PostView extends PostSummary {
 	canonical_url: string | null;
 	noindex: number;
 	category_id: number | null;
+	// 封面图是本站上传的图片时才有
+	cover_width: number | null;
+	cover_height: number | null;
 }
 
 export interface Term {
@@ -115,5 +118,7 @@ export interface MediaRow {
 	filename: string;
 	content_type: string;
 	size: number;
+	width: number | null;
+	height: number | null;
 	created_at: number;
 }

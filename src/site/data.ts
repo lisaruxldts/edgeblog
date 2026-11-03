@@ -1,7 +1,7 @@
 import { SUMMARY_COLS, VIEW_COLS, VISIBLE, commonStatements, readCommon } from "../db/queries";
 import type { Common, Reader } from "../db/queries";
 import type { PostSummary, PostView, RedirectRow, Site, Term } from "../db/types";
-import { now } from "../lib/util";
+import { canonicalFor, encodePath, now } from "../lib/util";
 import type { SitemapEntry } from "./feeds";
 
 // 每种页面的数据在一个 batch 里查完（一次往返）：重定向规则、正文或列表、侧栏。
@@ -185,37 +185,45 @@ export async function basePage(db: Reader, site: Site, redirectPath: string | nu
 	return { redirect, common };
 }
 
+// lastmod 必须是真实的内容变化时间：Google 只在它一贯准确时才采信，否则连带忽略整个 sitemap 的 lastmod。
+// 文章取更新和发布时间里较晚的（定时文章到点才出现，那一刻才算变化）；首页取全站最近一次变化
 export async function sitemapEntries(db: Reader, site: Site): Promise<SitemapEntry[]> {
 	const ts = now();
 	const [posts, cats] = await db.batch<Record<string, unknown>>([
 		db
 			.prepare(
-				`SELECT p.path, p.updated_at, p.type FROM posts p
+				`SELECT p.path, p.type, p.canonical_url, MAX(p.updated_at, p.published_at) AS lastmod FROM posts p
 				WHERE p.site_id = ?1 AND ${VISIBLE} AND p.noindex = 0 ORDER BY p.published_at DESC LIMIT 5000`,
 			)
 			.bind(site.id, ts),
 		db
 			.prepare(
-				`SELECT t.slug, MAX(p.updated_at) AS updated_at FROM terms t
+				`SELECT t.slug, MAX(MAX(p.updated_at, p.published_at)) AS lastmod FROM terms t
 				JOIN posts p ON p.category_id = t.id AND ${VISIBLE}
 				WHERE t.site_id = ?1 AND t.taxonomy = 'category' GROUP BY t.id LIMIT 500`,
 			)
 			.bind(site.id, ts),
 	]);
+	const rows = posts.results as { path: string; type: string; canonical_url: string | null; lastmod: number }[];
+	const origin = `https://${site.primary_domain}`;
 
-	const entries: SitemapEntry[] = [{ path: "/", lastmod: ts, changefreq: "daily", priority: "1.0" }];
-	for (const row of posts.results as { path: string; updated_at: number; type: string }[]) {
+	const entries: SitemapEntry[] = [
+		{ path: "/", lastmod: rows.reduce((max, r) => Math.max(max, Number(r.lastmod)), site.updated_at), changefreq: "daily", priority: "1.0" },
+	];
+	for (const row of rows) {
+		// sitemap 只列规范地址：canonical 指向别处（转载）的文章不列
+		if (canonicalFor(origin, row.path, row.canonical_url) !== origin + encodePath(row.path)) continue;
 		entries.push({
 			path: row.path,
-			lastmod: Number(row.updated_at),
+			lastmod: Number(row.lastmod),
 			changefreq: row.type === "page" ? "monthly" : "weekly",
 			priority: row.type === "page" ? "0.5" : "0.8",
 		});
 	}
-	for (const row of cats.results as { slug: string; updated_at: number }[]) {
+	for (const row of cats.results as { slug: string; lastmod: number }[]) {
 		entries.push({
 			path: `/${site.settings.category_base}/${row.slug}/`,
-			lastmod: Number(row.updated_at),
+			lastmod: Number(row.lastmod),
 			changefreq: "weekly",
 			priority: "0.6",
 		});

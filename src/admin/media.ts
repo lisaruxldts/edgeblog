@@ -1,5 +1,6 @@
 import { mediaTag, siteTag } from "../db/site";
 import type { MediaRow } from "../db/types";
+import { imageSize } from "../lib/imagesize";
 import { HttpError, now, slugify } from "../lib/util";
 import type { Ctx } from "./service";
 
@@ -44,9 +45,10 @@ export async function uploadMedia(
 	await bucket.put(key, body, {
 		httpMetadata: { contentType, cacheControl: "public, max-age=31536000, immutable" },
 	});
+	const dims = imageSize(body);
 	const row = await ctx.db
-		.prepare(`INSERT INTO media (site_id, path, filename, content_type, size, created_at) VALUES (?,?,?,?,?,?) RETURNING *`)
-		.bind(siteId, path, filename.slice(0, 200), contentType, body.byteLength, ts)
+		.prepare(`INSERT INTO media (site_id, path, filename, content_type, size, width, height, created_at) VALUES (?,?,?,?,?,?,?,?) RETURNING *`)
+		.bind(siteId, path, filename.slice(0, 200), contentType, body.byteLength, dims?.width ?? null, dims?.height ?? null, ts)
 		.first<MediaRow>();
 	await ctx.purge({ tags: [mediaTag(siteId)] });
 	return row as MediaRow;

@@ -3,7 +3,7 @@ import type { Child } from "hono/jsx";
 import type { Common } from "../db/queries";
 import type { PostSummary, PostView, Site, Term } from "../db/types";
 import { fill } from "../lib/i18n";
-import { isoDate, toAbsolute, truncate } from "../lib/util";
+import { canonicalFor, isoDate, toAbsolute, truncate } from "../lib/util";
 import { getTheme } from "../themes";
 import { FONT_STACKS } from "../themes/shared";
 import type { ArchiveData, ListData, PostData, ThemeContext } from "../themes/types";
@@ -14,6 +14,8 @@ interface HeadInput {
 	title: string;
 	description?: string;
 	canonicalPath: string;
+	// 文章在后台单独指定的 canonical，优先于 canonicalPath
+	canonicalUrl?: string;
 	robots?: string;
 	ogType?: string;
 	image?: string | null;
@@ -23,7 +25,7 @@ interface HeadInput {
 
 function assembleHead(ctx: ThemeContext, body: string, input: HeadInput): string {
 	const site = ctx.site;
-	const canonical = ctx.origin + ctx.href(input.canonicalPath);
+	const canonical = input.canonicalUrl ?? ctx.origin + ctx.href(input.canonicalPath);
 	const sep = site.settings.title_separator;
 	const fullTitle = input.title === site.name ? site.name : `${input.title}${sep}${site.name}`;
 	const image = toAbsolute(ctx.origin, input.image ?? undefined);
@@ -62,7 +64,11 @@ function assembleHead(ctx: ThemeContext, body: string, input: HeadInput): string
 		robots: input.robots,
 		canonical,
 		metas,
-		links: [{ rel: "alternate", type: "application/rss+xml", title: site.name, href: `${ctx.origin}/feed.xml` }, ...(input.links ?? [])],
+		links: [
+			{ rel: "icon", type: "image/svg+xml", href: `${ctx.origin}/favicon.svg` },
+			{ rel: "alternate", type: "application/rss+xml", title: site.name, href: `${ctx.origin}/feed.xml` },
+			...(input.links ?? []),
+		],
 		jsonLd: graph,
 		styleTag: buildCss(ctx),
 		headHtml: site.settings.head_html || undefined,
@@ -89,7 +95,16 @@ function postDescription(post: PostView): string {
 	return post.meta_description || post.excerpt || "";
 }
 
-function articleJsonLd(ctx: ThemeContext, post: PostView): unknown {
+// 没有封面图时，正文第一张图多半就是最大内容元素（LCP）：去掉懒加载并提高优先级。其余图片保持懒加载
+function eagerFirstImage(post: PostView): PostView {
+	if (post.cover_image) return post;
+	const content_html = post.content_html.replace(/<img\b[^>]*>/i, (tag) =>
+		tag.replace(/\sloading="lazy"/i, "").replace(/^<img\b/i, '<img fetchpriority="high"'),
+	);
+	return { ...post, content_html };
+}
+
+function articleJsonLd(ctx: ThemeContext, post: PostView, canonical: string): unknown {
 	const author = post.author_name || ctx.site.settings.author_name || ctx.site.name;
 	return {
 		"@context": "https://schema.org",
@@ -99,7 +114,7 @@ function articleJsonLd(ctx: ThemeContext, post: PostView): unknown {
 		dateModified: isoDate(post.updated_at),
 		author: { "@type": "Person", name: author },
 		publisher: { "@type": "Organization", name: ctx.site.name },
-		mainEntityOfPage: ctx.origin + ctx.href(post.path),
+		mainEntityOfPage: canonical,
 		...(post.cover_image ? { image: toAbsolute(ctx.origin, post.cover_image) } : {}),
 		...(postDescription(post) ? { description: postDescription(post) } : {}),
 		inLanguage: ctx.site.language,
@@ -180,28 +195,32 @@ export function renderArchive(input: RenderInput, data: ArchiveData): string {
 export function renderPost(input: RenderInput, data: PostData): string {
 	const ctx = buildContext({ ...input, view: "post" });
 	const Theme = getTheme(ctx.site.theme);
+	const post = eagerFirstImage(data.post);
 	const body = toHtml(
 		<Shell ctx={ctx}>
-			<Theme.Post ctx={ctx} data={data} />
+			<Theme.Post ctx={ctx} data={{ ...data, post }} />
 		</Shell>,
 	);
 	const trail = [{ name: ctx.t.home, path: "/" }];
-	if (data.post.category_slug) trail.push({ name: data.post.category_name ?? "", path: ctx.catHref(data.post.category_slug) });
-	trail.push({ name: data.post.title, path: data.post.path });
+	if (post.category_slug) trail.push({ name: post.category_name ?? "", path: ctx.catHref(post.category_slug) });
+	trail.push({ name: post.title, path: post.path });
+	const canonical = canonicalFor(ctx.origin, post.path, post.canonical_url);
 	return assembleHead(ctx, body, {
-		title: data.post.meta_title || data.post.title,
-		description: postDescription(data.post),
-		canonicalPath: data.post.path,
+		title: post.meta_title || post.title,
+		description: postDescription(post),
+		canonicalPath: post.path,
+		canonicalUrl: canonical,
 		ogType: "article",
-		image: data.post.cover_image,
-		robots: data.post.noindex ? "noindex, follow" : undefined,
-		jsonLd: [articleJsonLd(ctx, data.post), breadcrumb(ctx, trail)],
+		image: post.cover_image,
+		robots: post.noindex ? "noindex, follow" : undefined,
+		jsonLd: [articleJsonLd(ctx, post, canonical), breadcrumb(ctx, trail)],
 	});
 }
 
-export function renderPage(input: RenderInput, post: PostView): string {
+export function renderPage(input: RenderInput, page: PostView): string {
 	const ctx = buildContext({ ...input, view: "page" });
 	const Theme = getTheme(ctx.site.theme);
+	const post = eagerFirstImage(page);
 	const body = toHtml(
 		<Shell ctx={ctx}>
 			<Theme.Page ctx={ctx} data={{ post }} />
@@ -211,6 +230,7 @@ export function renderPage(input: RenderInput, post: PostView): string {
 		title: post.meta_title || post.title,
 		description: postDescription(post),
 		canonicalPath: post.path,
+		canonicalUrl: canonicalFor(ctx.origin, post.path, post.canonical_url),
 		image: post.cover_image,
 		robots: post.noindex ? "noindex, follow" : undefined,
 		jsonLd: [breadcrumb(ctx, [{ name: ctx.t.home, path: "/" }, { name: post.title, path: post.path }])],
